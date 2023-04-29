@@ -176,6 +176,8 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         device = idx.device
+        # da, sa = device[0],device[1]
+        # for i in range(2):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
@@ -187,6 +189,9 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
+        # x1 is da, x2 is sa
+        # s = simmilarity 
+        # grade = self.regression(s)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
