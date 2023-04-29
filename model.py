@@ -122,6 +122,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
+
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -367,3 +368,20 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+class TransferGPT(nn.Module):
+    def __init__(self, pretrained_model: GPT, config: GPTConfig):
+        super(TransferGPT, self).__init__()
+         # Define the original model with frozen weights
+        self.pretrained = pretrained_model 
+        for param in self.pretrained.parameters():
+            param.requires_grad = False
+
+        # Remove the last layer from the original model
+        self.pretrained.fc = nn.Identity()
+
+        # Now add one more MLP which will be used for the transfer learning process
+        # reuse the same MLP units we are using at the end of each block for simplicity
+        self.mlp = MLP(config)
+
+        # report number of parameters
+        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
