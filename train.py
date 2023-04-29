@@ -27,18 +27,19 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, TransferGPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
+pretrained_model_dir = 'pretrained'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'transfer' # 'scratch' or 'resume' or 'gpt2*' or 'transfer'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -109,21 +110,97 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# poor man's data loader
-data_dir = os.path.join('data', dataset)
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+if init_from != "transferd":
+    # poor man's data loader
+    data_dir = os.path.join('data', dataset)
+    train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    def get_batch(split):
+        data = train_data if split == 'train' else val_data
+        ix = torch.randint(len(data) - block_size, (batch_size,))
+        x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+        if device_type == 'cuda':
+            # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+            x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        else:
+            x, y = x.to(device), y.to(device)
+        return x, y
+else:
+    # if we we are in transfer mode, we don't want to load the openweb dataset
+    # we want to load Mohler instead
+    import pandas as pd
+    import numpy as np
+
+    data = pd.read_csv("mohler_dataset_edited.csv")
+
+    print(f"the size of the full dataset is {data.shape}")
+
+    # Split the DataFrame into training, validation, and testing sets
+    train, validate, test = np.split(data.sample(frac=1, random_state=42), [int(.7*len(data)), int(.9*len(data))])
+
+    # Print the sizes of the resulting sets
+    print("Training set size: ", len(train))
+    print("Validation set size: ", len(validate))
+    print("Testing set size: ", len(test))
+
+    import tiktoken
+
+    # So want to transform this data into X, Y pairs
+    # Each X will be the (question, desired_answer, student_answer)
+    # Y will be the corresponding score_avg
+    # Define a list of column names to select
+    selected_cols = ['question', 'desired_answer', 'student_answer']
+
+    # same process function as in prepare.py for the openweb dataset, I'm guessing we want the format to be the same?
+    # this time just take in the text directly
+    # and output the encod
+    enc = tiktoken.get_encoding("gpt2")
+    def process(text):
+        ids = enc.encode_ordinary(text) # encode_ordinary ignores any special tokens
+        ids.append(enc.eot_token) # add the end of text token, e.g. 50256 for gpt2 bpe
+        # note: I think eot should be prepended not appended... hmm. it's called "eot" though...
+        return ids
+
+    # process each of the columns we care about in the dataframe
+    # Apply the process function to each element of the selected columns
+    x_df = train[selected_cols]
+    print(x_df.head())
+
+    # # He has some fancy concatenation thing, writing this all to a file, its a little confusing
+    # # our dataset is small, I'm not going to worry about it, and will create tensors directly
+
+    first_row = x_df.iloc[0]
+    print(first_row)
+    encoded_input = []
+    encoded_dataframe = x_df.applymap(process)
+    encoded_dataframe.head()
+
+    first_row = encoded_dataframe.iloc[0]
+    print(first_row)
+
+    X_tuples = []
+    for index, row in encoded_dataframe.iterrows():
+        # convert to numpy arrays
+        # np_arr_question = np.array(row['question'])
+        # np_arr_desired_answer = np.array(row['desired_answer'])
+        # np_arr_student_answer = np.array(row['student_answer'])
+        question_tensor = torch.tensor(row['question'], dtype=torch.int64)
+        desired_answer_tensor = torch.tensor(row['desired_answer'], dtype=torch.int64)
+        student_answer_tensor = torch.tensor(row['student_answer'], dtype=torch.int64)
+        X_tuples.append((question_tensor, desired_answer_tensor, student_answer_tensor))
+
+    # sanity check to make sure this worked correctly
+    # the three elements should be the encoded question, desired_answer, and student answer. Each should end with the end token
+    print(f"First element of first tuple of x tuples: {X_tuples[0][0]}")
+    print(f"Second element of first tuple of x tuples: {X_tuples[0][1]}")
+    print(f"Third element of first tuple of x tuples: {X_tuples[0][2]}")
+
+    print(f"In total we have {len(X_tuples)} tuples in the training set")
+
+    # now get the average scores, which will be our y values
+    Y = np.array(train['score_avg'])
+    Y.shape
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -150,6 +227,34 @@ if init_from == 'scratch':
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+elif init_from == 'transfer':
+    print(f"Starting Transfer Learning from pretrained model saved in {pretrained_model_dir}")
+
+    # First, load the model. This works exactly the same way as in the 'resume' case,
+    # Except it is a transfer learning model.
+    ckpt_path = os.path.join(pretrained_model_dir, 'ckpt.pt')
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint_model_args = checkpoint['model_args']
+    # force these config attributes to be equal otherwise we can't even resume training
+    # the rest of the attributes (e.g. dropout) can stay as desired from command line
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = checkpoint_model_args[k]
+    # create the model
+    gptconf = GPTConfig(**model_args)
+    pretrained_model = GPT(gptconf)
+    state_dict = checkpoint['model']
+    # fix the keys of the state dictionary :(
+    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    pretrained_model.load_state_dict(state_dict)
+    iter_num = checkpoint['iter_num']
+    best_val_loss = checkpoint['best_val_loss']
+    # Once the model is loaded, feed it into the constructor of the new transferGPT class
+    model = TransferGPT(pretrained_model=pretrained_model, config=config)
+    print("Created transfer learning model successfully!")
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
