@@ -376,17 +376,73 @@ class GPT(nn.Module):
 class TransferGPT(nn.Module):
     def __init__(self, pretrained_model: GPT, config: GPTConfig):
         super(TransferGPT, self).__init__()
+        assert config.vocab_size is not None
+        assert config.block_size is not None
+        self.config = config
          # Define the original model with frozen weights
         self.pretrained = pretrained_model 
         for param in self.pretrained.parameters():
             param.requires_grad = False
 
         # Remove the last layer from the original model
-        self.pretrained.fc = nn.Identity()
+        # with this line, the parameter counts are as follows:
+        # number of trainable parameters: 4.72M
+        # number of total parameters: 129.09M
+        # Without it:
+        #
+        #
+        #TODO: verify this is a valid way of "removing" the last layer
+        # it will just pass the inputs directly through so I think this should do it 
+        self.pretrained.lm_head = nn.Identity()
 
         # Now add one more MLP which will be used for the transfer learning process
         # reuse the same MLP units we are using at the end of each block for simplicity
-        self.mlp = MLP(config)
+        self.regression_network = torch.nn.Sequential(
+            MLP(config),
+            torch.nn.ReLU(),
+            torch.nn.Linear(768, 1)
+        )
 
         # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        print("number of trainable parameters: %.2fM" % (self.get_num_trainable_params()/1e6,))
+        print("number of total parameters: %.2fM" % (self.get_num_total_params()/1e6,))
+
+        # also define a loss criterion just so we don't have to reinstantiate every time
+        self.loss_criterion = torch.nn.MSELoss()
+    
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+
+        # forward the GPT model itself
+        tok_emb = self.pretrained.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.pretrained.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        x = self.pretrained.drop(tok_emb + pos_emb)
+        for block in self.pretrained.h:
+            x = block(x)
+        x = self.pretrained.ln_f(x)
+
+        # here is where our forward method becomes different than the original
+        # rather than outputing logits, we want to output the prediction from the regression model
+        # as well as the loss
+        preds = self.regression_network(x)
+        loss = None
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            # what we want to return is the root MSE loss
+            # ref:https://stackoverflow.com/questions/61990363/rmse-loss-for-multi-output-regression-problem-in-pytorch
+            loss = torch.sqrt(self.loss_criterion(preds, targets))
+
+        return preds, loss
+
+    def get_num_trainable_params(self):
+        network_trainable_params = filter(lambda p: p.requires_grad, self.parameters())
+        n_params = sum([p.numel() for p in network_trainable_params])
+        return n_params
+
+    def get_num_total_params(self):
+        n_params = sum(p.numel() for p in self.parameters())
+        return n_params
