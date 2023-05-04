@@ -29,6 +29,8 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT, TransferGPT
 
+import random
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -47,7 +49,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -110,7 +112,7 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-if init_from != "transferd":
+if init_from != "transfer":
     # poor man's data loader
     data_dir = os.path.join('data', dataset)
     train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
@@ -131,7 +133,7 @@ else:
     # we want to load Mohler instead
     import pandas as pd
     import numpy as np
-
+    data_dir = os.path.join('data', dataset)
     data = pd.read_csv("mohler_dataset_edited.csv")
 
     print(f"the size of the full dataset is {data.shape}")
@@ -198,9 +200,26 @@ else:
 
     print(f"In total we have {len(X_tuples)} tuples in the training set")
 
+    eot_tensor = torch.tensor(enc.eot_token).unsqueeze(0)
+    x_data_joined = []
+    for tup in X_tuples:
+        x_tensor = torch.cat([tup[0], eot_tensor, tup[1], eot_tensor, tup[2]])
+        x_data_joined.append(x_tensor)
+
     # now get the average scores, which will be our y values
-    Y = np.array(train['score_avg'])
-    Y.shape
+    y_train_data = np.array(train['score_avg'])
+    y_train_data.shape
+
+    print("Done loading and preparing Mohler dataset")
+
+    def get_batch(split=None):
+        # NOTE: split parameter included for compatibility with other get_batch method
+        # not actually needed here at the moment, we always return a sample from the test set
+        sampled_indices = random.sample(range(0,len(X_tuples)), batch_size)
+        x_batch = torch.stack([x_data_joined[i] for i in sampled_indices])
+        y_batch = torch.stack([torch.tensor(y_train_data[i]) for i in sampled_indices])
+        x, y = x_batch.to(device), y_batch.to(device)
+        return x,y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -253,12 +272,12 @@ elif init_from == 'transfer':
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
     # Once the model is loaded, feed it into the constructor of the new transferGPT class
-    model = TransferGPT(pretrained_model=pretrained_model, config=config)
+    model = TransferGPT(pretrained_model=pretrained_model, config=gptconf)
     print("Created transfer learning model successfully!")
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(out_dir, 'ckpt_mingyu.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
