@@ -29,6 +29,12 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT, TransferGPT
 
+import torch.nn.functional as F
+
+
+import pandas as pd
+import numpy as np
+import tiktoken
 import random
 
 # -----------------------------------------------------------------------------
@@ -41,7 +47,7 @@ log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'resume' # 'scratch' or 'resume' or 'gpt2*' or 'transfer'
+init_from = 'transfer' # 'scratch' or 'resume' or 'gpt2*' or 'transfer'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -49,7 +55,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -131,8 +137,6 @@ if init_from != "transfer":
 else:
     # if we we are in transfer mode, we don't want to load the openweb dataset
     # we want to load Mohler instead
-    import pandas as pd
-    import numpy as np
     data_dir = os.path.join('data', dataset)
     data = pd.read_csv("mohler_dataset_edited.csv")
 
@@ -145,8 +149,6 @@ else:
     print("Training set size: ", len(train))
     print("Validation set size: ", len(validate))
     print("Testing set size: ", len(test))
-
-    import tiktoken
 
     # First we want to transform this data into X, Y pairs
     # Each X will be the (question, desired_answer, student_answer)
@@ -185,13 +187,21 @@ else:
     # now get the average scores, which will be our y values
     y_train_data = np.array(train['score_avg'])
 
+    # Now we want to perform one extra step, and pad all the x tensors so they are all the same length
+    # length should be block size
+    padded_samples = []
+    for sample in x_data_joined:
+        pad_length = block_size - len(sample)
+        padded_sample = F.pad(sample, (pad_length, 0), mode='constant', value=0)
+        padded_samples.append(padded_sample)
+
     print("Done loading and preparing Mohler dataset")
 
     def get_batch(split=None):
         # NOTE: split parameter included for compatibility with other get_batch method
         # not actually needed here at the moment, we always return a sample from the test set
         sampled_indices = random.sample(range(0,len(X_tuples)), batch_size)
-        x_batch = torch.stack([x_data_joined[i] for i in sampled_indices])
+        x_batch = torch.stack([padded_samples[i] for i in sampled_indices])
         y_batch = torch.stack([torch.tensor(y_train_data[i]) for i in sampled_indices])
         x, y = x_batch.to(device), y_batch.to(device)
         return x,y
