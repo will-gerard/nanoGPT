@@ -42,9 +42,9 @@ import random
 # I/O
 out_dir = 'out'
 pretrained_model_dir = 'pretrained'
-eval_interval = 100
+eval_interval = 30
 log_interval = 1
-eval_iters = 200
+eval_iters = 20
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'transfer' # 'scratch' or 'resume' or 'gpt2*' or 'transfer'
@@ -205,22 +205,30 @@ else:
     # length should be block size
     padded_train = []
     for sample in x_data_joined:
-        pad_length = block_size - len(sample)
-        padded_sample = F.pad(sample, (pad_length, 0), mode='constant', value=0)
-        padded_train.append(padded_sample)
+        if len(sample) > 255: # I think only one or two samples should meet this, allows less padding
+            print("WARN: dropping sample from training set, length longer than 255")
+            continue
+        else:
+            pad_length = block_size - len(sample)
+            padded_sample = F.pad(sample, (pad_length, 0), mode='constant', value=0)
+            padded_train.append(padded_sample)
 
     # again, do same operation on val
     padded_val = []
     for sample in val_data_joined:
-        pad_length = block_size - len(sample)
-        padded_sample = F.pad(sample, (pad_length, 0), mode='constant', value=0)
-        padded_val.append(padded_sample)
+        if len(sample) > 255: # I think only one or two samples should meet this, allows less padding
+            print("WARN: dropping sample from testing set, length longer than 255")
+            continue
+        else:
+            pad_length = block_size - len(sample)
+            padded_sample = F.pad(sample, (pad_length, 0), mode='constant', value=0)
+            padded_val.append(padded_sample)
 
     print("Done loading and preparing Mohler dataset")
 
     def get_batch(split):
         dataset = padded_train if split == 'train' else padded_val
-        sampled_indices = random.sample(range(0,len(X_tuples)), batch_size)
+        sampled_indices = random.sample(range(0,len(dataset)), batch_size)
         x_batch = torch.stack([dataset[i] for i in sampled_indices])
         y_batch = torch.stack([torch.tensor(y_train_data[i]) for i in sampled_indices])
         x, y = x_batch.to(device), y_batch.to(device)
