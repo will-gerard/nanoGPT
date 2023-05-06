@@ -403,9 +403,16 @@ class TransferGPT(nn.Module):
         # Now add one more MLP which will be used for the transfer learning process
         # reuse the same MLP units we are using at the end of each block for simplicity
         self.regression_network = torch.nn.Sequential(
-            MLP(config),
+            # MLP(config),
+            # TODO: figure out better way of doing this
+            # at model load time, we need block size to be equal to the checkpoint
+            # at the end of init we then crop the block size down
+            # but that means I can't really use block size in this constructor?
+            # I guess we need to add a new field to the config, pass a new value, etc.
+            # hardcoding it to the desired block size for now...
+            torch.nn.Linear(256 * self.config.n_embd, 64), # first dim should be blocksize * n_embd
             torch.nn.ReLU(),
-            torch.nn.Linear(768, 1)
+            torch.nn.Linear(64, 1)
         )
 
         # report number of parameters
@@ -431,7 +438,15 @@ class TransferGPT(nn.Module):
         # here is where our forward method becomes different than the original
         # rather than outputing logits, we want to output the prediction from the regression model
         # as well as the loss
-        preds = self.regression_network(x)
+
+        # we have x : (batch size x block size x n_embd)
+        # but we want to pass in a 1D input per batch element so that we can use simple linear layers and do regression,
+        # since the output is just a scalar
+        # so flatten x along second and third dimension
+        # hopefully this doesn't slow down training too much
+        # TODO: determine whether this is efficient / if there is a more efficient way
+        x = torch.flatten(x, 1, 2)
+        preds = self.regression_network(x).squeeze(1) # collapsing down to just a 1D vector for loss calculation
         loss = None
 
         if targets is not None:
