@@ -42,7 +42,7 @@ import random
 # I/O
 out_dir = 'out'
 pretrained_model_dir = 'pretrained'
-eval_interval = 2000
+eval_interval = 100
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -168,8 +168,10 @@ else:
 
     # process each of the columns we care about in the dataframe
     x_df = train[selected_cols]
+    val_df = validate[selected_cols]
     # Apply the process function to each element of the selected columns
     encoded_dataframe = x_df.applymap(process)
+    encoded_val_dataframe = val_df.applymap(process)
 
     # # He has some fancy concatenation thing, writing this all to a file, its a little confusing
     # # our dataset is small, I'm not going to worry about it, and will create tensors directly
@@ -183,25 +185,43 @@ else:
     for tup in X_tuples:
         x_tensor = torch.cat([tup[0], tup[1], tup[2]])
         x_data_joined.append(x_tensor)
+    
+    # do same thing with val dataset
+    val_tuples = []
+    for index, row in encoded_val_dataframe.iterrows():
+        question_tensor = torch.tensor(row['question'], dtype=torch.int64)
+        desired_answer_tensor = torch.tensor(row['desired_answer'], dtype=torch.int64)
+        student_answer_tensor = torch.tensor(row['student_answer'], dtype=torch.int64)
+        val_tuples.append((question_tensor, desired_answer_tensor, student_answer_tensor))
+    val_data_joined = []
+    for tup in val_tuples:
+        val_tensor = torch.cat([tup[0], tup[1], tup[2]])
+        val_data_joined.append(val_tensor)
 
     # now get the average scores, which will be our y values
     y_train_data = np.array(train['score_avg'])
 
     # Now we want to perform one extra step, and pad all the x tensors so they are all the same length
     # length should be block size
-    padded_samples = []
+    padded_train = []
     for sample in x_data_joined:
         pad_length = block_size - len(sample)
         padded_sample = F.pad(sample, (pad_length, 0), mode='constant', value=0)
-        padded_samples.append(padded_sample)
+        padded_train.append(padded_sample)
+
+    # again, do same operation on val
+    padded_val = []
+    for sample in val_data_joined:
+        pad_length = block_size - len(sample)
+        padded_sample = F.pad(sample, (pad_length, 0), mode='constant', value=0)
+        padded_val.append(padded_sample)
 
     print("Done loading and preparing Mohler dataset")
 
-    def get_batch(split=None):
-        # NOTE: split parameter included for compatibility with other get_batch method
-        # not actually needed here at the moment, we always return a sample from the test set
+    def get_batch(split):
+        dataset = padded_train if split == 'train' else padded_val
         sampled_indices = random.sample(range(0,len(X_tuples)), batch_size)
-        x_batch = torch.stack([padded_samples[i] for i in sampled_indices])
+        x_batch = torch.stack([dataset[i] for i in sampled_indices])
         y_batch = torch.stack([torch.tensor(y_train_data[i]) for i in sampled_indices])
         x, y = x_batch.to(device), y_batch.to(device)
         return x,y
