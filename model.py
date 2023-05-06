@@ -402,25 +402,35 @@ class TransferGPT(nn.Module):
 
         # Now add one more MLP which will be used for the transfer learning process
         # reuse the same MLP units we are using at the end of each block for simplicity
-        self.regression_network = torch.nn.Sequential(
-            # MLP(config),
-            # TODO: figure out better way of doing this
-            # at model load time, we need block size to be equal to the checkpoint
-            # at the end of init we then crop the block size down
-            # but that means I can't really use block size in this constructor?
-            # I guess we need to add a new field to the config, pass a new value, etc.
-            # hardcoding it to the desired block size for now...
-            torch.nn.Linear(256 * self.config.n_embd, 64), # first dim should be blocksize * n_embd
-            torch.nn.ReLU(),
-            torch.nn.Linear(64, 1)
-        )
+        # self.regression_network = torch.nn.Sequential(
+        #     # MLP(config),
+        #     # TODO: figure out better way of doing this
+        #     # at model load time, we need block size to be equal to the checkpoint
+        #     # at the end of init we then crop the block size down
+        #     # but that means I can't really use block size in this constructor?
+        #     # I guess we need to add a new field to the config, pass a new value, etc.
+        #     # hardcoding it to the desired block size for now...
+        #     torch.nn.Linear((self.config.n_embd), 1), # first dim should be blocksize * n_embd
+        #     torch.nn.ReLU(),
+        #     torch.nn.Linear(256, 1)
+        # )
+        # one linear layer to collapse output along embedding dimension
+        self.lin1 = torch.nn.Linear(self.config.n_embd, 1, bias=False)
+        # # then small mlp to perform actual regression
+        # self.regression_network = torch.nn.Sequential(
+        #     torch.nn.Linear(256, 32), # first dim should be blocksize * n_embd
+        #     torch.nn.ReLU(),
+        #     torch.nn.Linear(32, 1)
+        # )
+        self.reg = torch.nn.Linear(256, 1, bias=False)
 
         # report number of parameters
-        print("number of trainable parameters: %.2fM" % (self.get_num_trainable_params()/1e6,))
+        print("number of trainable parameters: %.2fk" % (self.get_num_trainable_params()/1e3,))
         print("number of total parameters: %.2fM" % (self.get_num_total_params()/1e6,))
 
         # also define a loss criterion just so we don't have to reinstantiate every time
         self.loss_criterion = torch.nn.MSELoss()
+        self.double()
     
     def forward(self, idx, targets=None):
         device = idx.device
@@ -445,8 +455,10 @@ class TransferGPT(nn.Module):
         # so flatten x along second and third dimension
         # hopefully this doesn't slow down training too much
         # TODO: determine whether this is efficient / if there is a more efficient way
-        x = torch.flatten(x, 1, 2)
-        preds = self.regression_network(x).squeeze(1) # collapsing down to just a 1D vector for loss calculation
+        # x = torch.flatten(x, 1, 2)
+        # preds = self.regression_network(x).squeeze(1) # collapsing down to just a 1D vector for loss calculation
+        x = self.lin1(x).squeeze(-1) # go from (batch size x block size x n_embd) to (batch size x block size)
+        preds = self.reg(x).squeeze(-1)
         loss = None
 
         if targets is not None:
