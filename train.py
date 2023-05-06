@@ -41,7 +41,7 @@ log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'transfer' # 'scratch' or 'resume' or 'gpt2*' or 'transfer'
+init_from = 'resume' # 'scratch' or 'resume' or 'gpt2*' or 'transfer'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -73,7 +73,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+dtype = 'float32' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -148,7 +148,7 @@ else:
 
     import tiktoken
 
-    # So want to transform this data into X, Y pairs
+    # First we want to transform this data into X, Y pairs
     # Each X will be the (question, desired_answer, student_answer)
     # Y will be the corresponding score_avg
     # Define a list of column names to select
@@ -165,50 +165,25 @@ else:
         return ids
 
     # process each of the columns we care about in the dataframe
-    # Apply the process function to each element of the selected columns
     x_df = train[selected_cols]
-    print(x_df.head())
+    # Apply the process function to each element of the selected columns
+    encoded_dataframe = x_df.applymap(process)
 
     # # He has some fancy concatenation thing, writing this all to a file, its a little confusing
     # # our dataset is small, I'm not going to worry about it, and will create tensors directly
-
-    first_row = x_df.iloc[0]
-    print(first_row)
-    encoded_input = []
-    encoded_dataframe = x_df.applymap(process)
-    encoded_dataframe.head()
-
-    first_row = encoded_dataframe.iloc[0]
-    print(first_row)
-
     X_tuples = []
     for index, row in encoded_dataframe.iterrows():
-        # convert to numpy arrays
-        # np_arr_question = np.array(row['question'])
-        # np_arr_desired_answer = np.array(row['desired_answer'])
-        # np_arr_student_answer = np.array(row['student_answer'])
         question_tensor = torch.tensor(row['question'], dtype=torch.int64)
         desired_answer_tensor = torch.tensor(row['desired_answer'], dtype=torch.int64)
         student_answer_tensor = torch.tensor(row['student_answer'], dtype=torch.int64)
         X_tuples.append((question_tensor, desired_answer_tensor, student_answer_tensor))
-
-    # sanity check to make sure this worked correctly
-    # the three elements should be the encoded question, desired_answer, and student answer. Each should end with the end token
-    print(f"First element of first tuple of x tuples: {X_tuples[0][0]}")
-    print(f"Second element of first tuple of x tuples: {X_tuples[0][1]}")
-    print(f"Third element of first tuple of x tuples: {X_tuples[0][2]}")
-
-    print(f"In total we have {len(X_tuples)} tuples in the training set")
-
-    eot_tensor = torch.tensor(enc.eot_token).unsqueeze(0)
     x_data_joined = []
     for tup in X_tuples:
-        x_tensor = torch.cat([tup[0], eot_tensor, tup[1], eot_tensor, tup[2]])
+        x_tensor = torch.cat([tup[0], tup[1], tup[2]])
         x_data_joined.append(x_tensor)
 
     # now get the average scores, which will be our y values
     y_train_data = np.array(train['score_avg'])
-    y_train_data.shape
 
     print("Done loading and preparing Mohler dataset")
 
@@ -277,7 +252,7 @@ elif init_from == 'transfer':
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt_mingyu.pt')
+    ckpt_path = os.path.join(out_dir, 'mingyu-ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
@@ -312,7 +287,7 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+#scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -417,18 +392,19 @@ while True:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
+            loss = loss.float()
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
+        # scaler.scale(loss).backward()
     # clip the gradient
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
+        # scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
+    # scaler.step(optimizer)
+    # scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
@@ -440,10 +416,11 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        # if local_iter_num >= 5: # let the training loop settle a bit
+        #     mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+        #     running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+        # print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
     iter_num += 1
     local_iter_num += 1
 
