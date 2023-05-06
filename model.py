@@ -56,11 +56,17 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+            # TODO: I think this is where we could add a mask if we wanted to
+            # this should allow us to ignore all the padding elements in the input, shouldn't it?
+            # the same way it currently prevents the future tokens from impacting the current one?
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # Karpathy explains around 1:15:00 that this is "self" attention because the same x is used
+        # to compute query, key and value
+        # he mentions one alternative, cross attention, which may be useful to look into for ASAG
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -73,6 +79,9 @@ class CausalSelfAttention(nn.Module):
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # Karpathy explains at ~1:12:00 mark that this is what makes this a decoder block, "decoding language"
+            # if we want to use an encoder instead, we want to get rid of the mask
+            # What is the difference between this and the causal mask above??
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
@@ -324,7 +333,8 @@ class GPT(nn.Module):
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
         # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
-        use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+        # use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+        use_fused = False
         print(f"using fused AdamW: {use_fused}")
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
@@ -497,9 +507,21 @@ class TransferGPT(nn.Module):
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
         # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
-        use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
-        print(f"using fused AdamW: {use_fused}")
+        # use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+        # print(f"using fused AdamW: {use_fused}")
+        use_fused = False
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
 
         return optimizer
+
+    def crop_block_size(self, block_size):
+        # model surgery to decrease the block size if necessary
+        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
+        # but want to use a smaller block size for some smaller, simpler model
+        assert block_size <= self.config.block_size
+        self.config.block_size = block_size
+        self.pretrained.transformer.wpe.weight = nn.Parameter(self.pretrained.transformer.wpe.weight[:block_size])
+        for block in self.pretrained.transformer.h:
+            if hasattr(block.attn, 'bias'):
+                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
