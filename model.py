@@ -390,7 +390,10 @@ class TransferGPT(nn.Module):
         assert config.block_size is not None
         self.config = config
          # Define the original model with frozen weights
-        self.pretrained: GPT = pretrained_model 
+        if pretrained_model is None:
+            self.pretrained: GPT = GPT(config)
+        else:
+            self.pretrained: GPT = pretrained_model 
         for param in self.pretrained.parameters():
             param.requires_grad = False
 
