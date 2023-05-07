@@ -124,16 +124,20 @@ if init_from != "transfer":
     train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     def get_batch(split):
+        tensor_form_start = time.perf_counter()
         data = train_data if split == 'train' else val_data
         ix = torch.randint(len(data) - block_size, (batch_size,))
         x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
         y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+        tensor_form_time = time.perf_counter() - tensor_form_start
+        data_transfer_start = time.perf_counter()
         if device_type == 'cuda':
             # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
             x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
         else:
             x, y = x.to(device), y.to(device)
-        return x, y
+        data_transfer_time = time.perf_counter() - data_transfer_start
+        return x, y, tensor_form_time, data_transfer_time
 else:
     # if we we are in transfer mode, we don't want to load the openweb dataset
     # we want to load Mohler instead
@@ -197,9 +201,14 @@ else:
     for tup in val_tuples:
         val_tensor = torch.cat([tup[0], tup[1], tup[2]])
         val_data_joined.append(val_tensor)
-
+    
     # now get the average scores, which will be our y values
+    # move these to the GPU directly, the dataset is small so we can afford to keep it in GPU 
+    # memory the entire time
     y_train_data = np.array(train['score_avg'])
+    y_train_tensor = torch.stack(y_train_data).to(device)
+    y_val_data = np.array(validate['score_avg'])
+    y_val_tensor = torch.stack(y_val_data).to(device)
 
     # Now we want to perform one extra step, and pad all the x tensors so they are all the same length
     # length should be block size
@@ -212,6 +221,9 @@ else:
             pad_length = block_size - len(sample)
             padded_sample = F.pad(sample, (pad_length, 0), mode='constant', value=0)
             padded_train.append(padded_sample)
+    
+    # convert to tensors and move these tensors to the GPU up front
+    padded_train = padded_train.to(device)
 
     # again, do same operation on val
     padded_val = []
@@ -223,16 +235,28 @@ else:
             pad_length = block_size - len(sample)
             padded_sample = F.pad(sample, (pad_length, 0), mode='constant', value=0)
             padded_val.append(padded_sample)
+    
+    padded_val = padded_val.to(device)
 
     print("Done loading and preparing Mohler dataset")
 
     def get_batch(split):
+        tensor_form_start = time.perf_counter()
         dataset = padded_train if split == 'train' else padded_val
+        y_dataset = y_train_data if split == 'train' else y_val_data 
         sampled_indices = random.sample(range(0,len(dataset)), batch_size)
         x_batch = torch.stack([dataset[i] for i in sampled_indices])
-        y_batch = torch.stack([torch.tensor(y_train_data[i]) for i in sampled_indices])
-        x, y = x_batch.to(device), y_batch.to(device)
-        return x,y
+        y_batch = torch.stack([torch.tensor(y_dataset[i]) for i in sampled_indices])
+        tensor_form_time = time.perf_counter() - tensor_form_start
+
+        data_transfer_start = time.perf_counter()
+        if device_type == 'cuda':
+            # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+            x, y = x_batch.pin_memory().to(device, non_blocking=True), y_batch.pin_memory().to(device, non_blocking=True)
+        else:
+            x, y = x_batch.to(device), y_batch.to(device)
+        data_transfer_time = time.perf_counter() - data_transfer_start
+        return x,y, tensor_form_time, data_transfer_time
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -264,7 +288,7 @@ elif init_from == 'transfer':
 
     # First, load the model. This works exactly the same way as in the 'resume' case,
     # Except it is a transfer learning model.
-    ckpt_path = os.path.join(pretrained_model_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(pretrained_model_dir, 'ckpt_full.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
@@ -351,7 +375,7 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y, _, _ = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
@@ -379,12 +403,19 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y, _, _ = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
+    total_data_loading_time = 0
+    data_loading_tensor_form_time = 0
+    data_loading_tensor_transfer_time = 0
+    total_forward_pass_time = 0
+    total_backward_pass_time = 0
+    total_validation_set_eval_time = 0
+    total_log_data_transfer_time = 0
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -393,7 +424,9 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
+        estimate_loss_start_time = time.perf_counter()
         losses = estimate_loss()
+        total_validation_set_eval_time += (time.perf_counter() - estimate_loss_start_time)
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
@@ -429,13 +462,21 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
+            forward_pass_start_time = time.perf_counter()
             logits, loss = model(X, Y)
+            total_forward_pass_time += (time.perf_counter() - forward_pass_start_time)
             loss = loss.float()
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        data_load_start_time = time.perf_counter()
+        X, Y, form_time, transfer_time = get_batch('train')
+        total_data_loading_time += (time.perf_counter() - data_load_start_time)
+        data_loading_tensor_form_time += form_time
+        data_loading_tensor_transfer_time += transfer_time
         # backward pass, with gradient scaling if training in fp16
+        backward_pass_start_time = time.perf_counter()
         loss.backward()
+        total_backward_pass_time += (time.perf_counter() - backward_pass_start_time)
     # clip the gradient
     if grad_clip != 0.0:
         # scaler.unscale_(optimizer)
@@ -453,12 +494,22 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+        log_transfer_start = time.perf_counter()
         lossf = loss.item() * gradient_accumulation_steps
+        total_log_data_transfer_time += (time.perf_counter() - log_transfer_start)
         # if local_iter_num >= 5: # let the training loop settle a bit
         #     mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
         #     running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         # print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
+        print(f"Printing average perf counter times for the last {log_interval} iterations:")
+        print(f"Average forward pass time: {total_forward_pass_time}")
+        print(f"Average backward pass time: {total_backward_pass_time}")
+        print(f"Average data loading time: {total_data_loading_time}")
+        print(f"Average tensor form time: {data_loading_tensor_form_time}")
+        print(f"Average data transfer time: {data_loading_tensor_transfer_time}")
+        print(f"Average validation set eval time: {total_validation_set_eval_time}")
+        print(f"Average logging time: {total_log_data_transfer_time}")
     iter_num += 1
     local_iter_num += 1
 
