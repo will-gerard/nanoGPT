@@ -56,11 +56,17 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+            # TODO: I think this is where we could add a mask if we wanted to
+            # this should allow us to ignore all the padding elements in the input, shouldn't it?
+            # the same way it currently prevents the future tokens from impacting the current one?
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # Karpathy explains around 1:15:00 that this is "self" attention because the same x is used
+        # to compute query, key and value
+        # he mentions one alternative, cross attention, which may be useful to look into for ASAG
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -73,6 +79,9 @@ class CausalSelfAttention(nn.Module):
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # Karpathy explains at ~1:12:00 mark that this is what makes this a decoder block, "decoding language"
+            # if we want to use an encoder instead, we want to get rid of the mask
+            # What is the difference between this and the causal mask above??
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
@@ -121,6 +130,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
 
 class GPT(nn.Module):
 
@@ -323,7 +333,8 @@ class GPT(nn.Module):
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
         # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
-        use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+        # use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+        use_fused = False
         print(f"using fused AdamW: {use_fused}")
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
@@ -372,3 +383,175 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+class TransferGPT(nn.Module):
+    def __init__(self, pretrained_model: GPT, config: GPTConfig):
+        super(TransferGPT, self).__init__()
+        assert config.vocab_size is not None
+        assert config.block_size is not None
+        self.config = config
+         # Define the original model with frozen weights
+        if pretrained_model is None:
+            self.pretrained: GPT = GPT(config)
+        else:
+            self.pretrained: GPT = pretrained_model 
+        for param in self.pretrained.parameters():
+            param.requires_grad = False
+
+        # Remove the last layer from the original model
+        # with this line, the parameter counts are as follows:
+        # number of trainable parameters: 4.72M
+        # number of total parameters: 129.09M
+        # Without it:
+        #
+        #
+        #TODO: verify this is a valid way of "removing" the last layer
+        # it will just pass the inputs directly through so I think this should do it 
+        self.pretrained.lm_head = nn.Identity()
+
+        # Now add one more MLP which will be used for the transfer learning process
+        # reuse the same MLP units we are using at the end of each block for simplicity
+        # self.regression_network = torch.nn.Sequential(
+        #     # MLP(config),
+        #     # TODO: figure out better way of doing this
+        #     # at model load time, we need block size to be equal to the checkpoint
+        #     # at the end of init we then crop the block size down
+        #     # but that means I can't really use block size in this constructor?
+        #     # I guess we need to add a new field to the config, pass a new value, etc.
+        #     # hardcoding it to the desired block size for now...
+        #     torch.nn.Linear((self.config.n_embd), 1), # first dim should be blocksize * n_embd
+        #     torch.nn.ReLU(),
+        #     torch.nn.Linear(256, 1)
+        # )
+        # one linear layer to collapse output along embedding dimension
+        self.lin1 = torch.nn.Linear(self.config.n_embd, 1, bias=False)
+        # # then small mlp to perform actual regression
+        # self.regression_network = torch.nn.Sequential(
+        #     torch.nn.Linear(256, 32), # first dim should be blocksize * n_embd
+        #     torch.nn.ReLU(),
+        #     torch.nn.Linear(32, 1)
+        # )
+        self.reg = torch.nn.Linear(256, 1, bias=False)
+
+        # report number of parameters
+        print("number of trainable parameters: %.2fk" % (self.get_num_trainable_params()/1e3,))
+        print("number of total parameters: %.2fM" % (self.get_num_total_params()/1e6,))
+
+        # also define a loss criterion just so we don't have to reinstantiate every time
+        self.loss_criterion = torch.nn.MSELoss()
+        self.double()
+    
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+
+        # forward the GPT model itself
+        tok_emb = self.pretrained.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.pretrained.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        x = self.pretrained.transformer.drop(tok_emb + pos_emb)
+        for block in self.pretrained.transformer.h:
+            x = block(x)
+        x = self.pretrained.transformer.ln_f(x)
+
+        # here is where our forward method becomes different than the original
+        # rather than outputing logits, we want to output the prediction from the regression model
+        # as well as the loss
+
+        # we have x : (batch size x block size x n_embd)
+        # but we want to pass in a 1D input per batch element so that we can use simple linear layers and do regression,
+        # since the output is just a scalar
+        # so flatten x along second and third dimension
+        # hopefully this doesn't slow down training too much
+        # TODO: determine whether this is efficient / if there is a more efficient way
+        # x = torch.flatten(x, 1, 2)
+        # preds = self.regression_network(x).squeeze(1) # collapsing down to just a 1D vector for loss calculation
+        x = self.lin1(x).squeeze(-1) # go from (batch size x block size x n_embd) to (batch size x block size)
+        preds = self.reg(x).squeeze(-1)
+        loss = None
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            # what we want to return is the root MSE loss
+            # ref:https://stackoverflow.com/questions/61990363/rmse-loss-for-multi-output-regression-problem-in-pytorch
+            loss = torch.sqrt(self.loss_criterion(preds, targets))
+
+        return preds, loss
+
+    def get_num_trainable_params(self):
+        network_trainable_params = filter(lambda p: p.requires_grad, self.parameters())
+        n_params = sum([p.numel() for p in network_trainable_params])
+        return n_params
+
+    def get_num_total_params(self):
+        n_params = sum(p.numel() for p in self.parameters())
+        return n_params
+    
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        """
+        This long function is unfortunately doing something very simple and is being very defensive:
+        We are separating out all parameters of the model into two buckets: those that will experience
+        weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
+        We are then returning the PyTorch optimizer object.
+        """
+
+        # separate out all parameters to those that will and won't experience regularizing weight decay
+        decay = set()
+        no_decay = set()
+        whitelist_weight_modules = (torch.nn.Linear, )
+        blacklist_weight_modules = (torch.nn.LayerNorm, LayerNorm, torch.nn.Embedding)
+        for mn, m in self.named_modules():
+            for pn, p in m.named_parameters():
+                fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
+                # random note: because named_modules and named_parameters are recursive
+                # we will see the same tensors p many many times. but doing it this way
+                # allows us to know which parent module any tensor p belongs to...
+                if pn.endswith('bias'):
+                    # all biases will not be decayed
+                    no_decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+                    # weights of whitelist modules will be weight decayed
+                    decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+                    # weights of blacklist modules will NOT be weight decayed
+                    no_decay.add(fpn)
+
+        # subtle: 'transformer.wte.weight' and 'lm_head.weight' are tied, so they
+        # will appear in the no_decay and decay sets respectively after the above.
+        # In addition, because named_parameters() doesn't return duplicates, it
+        # will only return the first occurence, key'd by 'transformer.wte.weight', below.
+        # so let's manually remove 'lm_head.weight' from decay set. This will include
+        # this tensor into optimization via transformer.wte.weight only, and not decayed.
+        #decay.remove('lm_head.weight')
+
+        # validate that we considered every parameter
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        inter_params = decay & no_decay
+        union_params = decay | no_decay
+        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
+        assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
+                                                    % (str(param_dict.keys() - union_params), )
+
+        # create the pytorch optimizer object
+        optim_groups = [
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+        ]
+        # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
+        # use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+        # print(f"using fused AdamW: {use_fused}")
+        use_fused = False
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+
+        return optimizer
+
+    def crop_block_size(self, block_size):
+        # model surgery to decrease the block size if necessary
+        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
+        # but want to use a smaller block size for some smaller, simpler model
+        assert block_size <= self.config.block_size
+        self.config.block_size = block_size
+        self.pretrained.transformer.wpe.weight = nn.Parameter(self.pretrained.transformer.wpe.weight[:block_size])
+        for block in self.pretrained.transformer.h:
+            if hasattr(block.attn, 'bias'):
+                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
