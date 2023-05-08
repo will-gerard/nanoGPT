@@ -7,6 +7,7 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+import time
 import math
 import inspect
 from dataclasses import dataclass
@@ -446,12 +447,16 @@ class TransferGPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
+        embed_time_start = time.perf_counter()
         tok_emb = self.pretrained.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.pretrained.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.pretrained.transformer.drop(tok_emb + pos_emb)
+        embed_time = time.perf_counter() - embed_time_start
+        transformer_layer_start = time.perf_counter()
         for block in self.pretrained.transformer.h:
             x = block(x)
         x = self.pretrained.transformer.ln_f(x)
+        pretrained_forwarding_time = time.perf_counter() - transformer_layer_start
 
         # here is where our forward method becomes different than the original
         # rather than outputing logits, we want to output the prediction from the regression model
@@ -465,17 +470,21 @@ class TransferGPT(nn.Module):
         # TODO: determine whether this is efficient / if there is a more efficient way
         # x = torch.flatten(x, 1, 2)
         # preds = self.regression_network(x).squeeze(1) # collapsing down to just a 1D vector for loss calculation
+        linear_layer_start = time.perf_counter()
         x = self.lin1(x).squeeze(-1) # go from (batch size x block size x n_embd) to (batch size x block size)
         preds = self.reg(x).squeeze(-1)
+        linear_layer_time = time.perf_counter() - linear_layer_start
         loss = None
 
+        loss_comp_start = time.perf_counter()
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             # what we want to return is the root MSE loss
             # ref:https://stackoverflow.com/questions/61990363/rmse-loss-for-multi-output-regression-problem-in-pytorch
             loss = torch.sqrt(self.loss_criterion(preds, targets))
+        loss_compute_time = time.perf_counter() - loss_comp_start 
 
-        return preds, loss
+        return preds, loss, embed_time, pretrained_forwarding_time, linear_layer_time, loss_compute_time
 
     def get_num_trainable_params(self):
         network_trainable_params = filter(lambda p: p.requires_grad, self.parameters())
