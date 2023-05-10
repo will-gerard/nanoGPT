@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.profiler import profile, record_function, ProfilerActivity
 
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
@@ -453,10 +454,12 @@ class TransferGPT(nn.Module):
         x = self.pretrained.transformer.drop(tok_emb + pos_emb)
         embed_time = time.perf_counter() - embed_time_start
         transformer_layer_start = time.perf_counter()
-        for block in self.pretrained.transformer.h:
-            x = block(x)
-        x = self.pretrained.transformer.ln_f(x)
+        with profile(activities=[ProfilerActivity.CUDA], profile_memory=True, record_shapes=True) as prof:
+            for block in self.pretrained.transformer.h:
+                x = block(x)
+            x = self.pretrained.transformer.ln_f(x)
         pretrained_forwarding_time = time.perf_counter() - transformer_layer_start
+        print(prof.key_averages().table(row_limit=10))
 
         # here is where our forward method becomes different than the original
         # rather than outputing logits, we want to output the prediction from the regression model
