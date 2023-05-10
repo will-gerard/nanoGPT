@@ -510,6 +510,8 @@ while True:
         print(f"Average data transfer time: {data_loading_tensor_transfer_time}")
         print(f"Average validation set eval time: {total_validation_set_eval_time}")
         print(f"Average logging time: {total_log_data_transfer_time}")
+        # print(f"Printing cuda memory summary from pytorch:")
+        # print(torch.cuda.memory_summary())
     iter_num += 1
     local_iter_num += 1
 
