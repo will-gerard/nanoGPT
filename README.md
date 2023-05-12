@@ -15,6 +15,12 @@ To perform the transfer learning related operations, please ensure you are in an
 
 With everything in place, different functionalities can be exercised as explained below:
 
+Preparing OpenWebText dataset 
+
+```
+python data/openwebtext/prepare.py
+```
+
 Pretraining:
 
 ```
