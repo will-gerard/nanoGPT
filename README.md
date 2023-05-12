@@ -47,5 +47,7 @@ python hyperparam_sweep.py
 
 ## Results
 
-
+![table2](assets/table2.png)
+![table3](assets/table3.png)
+![figure11](assets/figure11.png)
 
