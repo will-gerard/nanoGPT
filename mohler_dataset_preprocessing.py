@@ -107,9 +107,9 @@ def preprocess_dataset(data: pd.DataFrame, device, block_size, encoding_function
 
     return padded_train, y_train_tensor, padded_val, y_val_tensor
 
-def get_batch(x, y, batch_size):
+def get_batch(x, y, batch_size, device):
     sampled_indices = random.sample(range(0,len(x)), batch_size)
     x_batch = torch.stack([x[i] for i in sampled_indices])
     y_batch = torch.stack([y[i] for i in sampled_indices])
-    # x, y = x_batch.to(device), y_batch.to(device)
+    x, y = x_batch.to(device), y_batch.to(device)
     return x_batch, y_batch
