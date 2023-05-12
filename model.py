@@ -445,26 +445,13 @@ class TransferGPT(nn.Module):
             x = block(x)
         x = self.pretrained.transformer.ln_f(x)
 
-        # here is where our forward method becomes different than the original
         # rather than outputing logits, we want to output the prediction from the regression model
-        # as well as the loss
-
         # we have x : (batch size x block size x n_embd)
-        # but we want to pass in a 1D input per batch element so that we can use simple linear layers and do regression,
-        # since the output is just a scalar
-        # so flatten x along second and third dimension
-        # hopefully this doesn't slow down training too much
-        # TODO: determine whether this is efficient / if there is a more efficient way
-        # x = torch.flatten(x, 1, 2)
-        # preds = self.regression_network(x).squeeze(1) # collapsing down to just a 1D vector for loss calculation
         x = self.lin1(x).squeeze(-1) # go from (batch size x block size x n_embd) to (batch size x block size)
         preds = self.reg(x).squeeze(-1)
         loss = None
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            # what we want to return is the root MSE loss
-            # ref:https://stackoverflow.com/questions/61990363/rmse-loss-for-multi-output-regression-problem-in-pytorch
             loss = torch.sqrt(self.loss_criterion(preds, targets))
 
         return preds, loss
