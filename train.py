@@ -42,6 +42,7 @@ import random
 # I/O
 out_dir = 'out'
 pretrained_model_dir = 'pretrained'
+model_file_name = 'ckpt.pt'
 eval_interval = 30
 log_interval = 1
 eval_iters = 20
@@ -288,7 +289,7 @@ elif init_from == 'transfer':
 
     # First, load the model. This works exactly the same way as in the 'resume' case,
     # Except it is a transfer learning model.
-    ckpt_path = os.path.join(pretrained_model_dir, 'ckpt_full.pt')
+    ckpt_path = os.path.join(pretrained_model_dir, model_file_name)
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
