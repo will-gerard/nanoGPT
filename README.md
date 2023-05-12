@@ -5,6 +5,8 @@ This repository is based on the original NanoGPT repository: https://github.com/
 
 ![nanoGPT](assets/nanogpt.jpg)
 
+Logging is done via Weights and Biases. See one of the sample projects we have used to log our experiment runs here: https://wandb.ai/wg2404/NanoGPT-TransferLearning?workspace=user-wg2404.
+
 ## Project Description
 In this work we extend the open source NanoGPT repository to perform transfer learning on a pretrained GPT model to complete the Automatic Short Answer Grading task. By reducing the pretrained model to a simpler architecture with fewer parameters, optimizing the data loading portion of the training loop, timing and profiling the code, and switching to more powerful hardware, we are able to reduce runtime on the ASAG task without harming signifanctly harming performance. Our final results fall short of state of the art, however our framework can now be used to easily experiment with new architectures and settings to try to improve ASAG performance.
 
