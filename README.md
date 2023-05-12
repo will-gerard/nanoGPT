@@ -15,6 +15,12 @@ To perform the transfer learning related operations, please ensure you are in an
 
 With everything in place, different functionalities can be exercised as explained below:
 
+Pretraining:
+
+```
+python train.py config/train_12_768_1024.py
+```
+
 Transfer Learning Training:
 
 ```
