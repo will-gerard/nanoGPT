@@ -42,6 +42,7 @@ import random
 # I/O
 out_dir = 'out'
 pretrained_model_dir = 'pretrained'
+model_file_name = 'ckpt.pt'
 eval_interval = 30
 log_interval = 1
 eval_iters = 20
@@ -288,7 +289,7 @@ elif init_from == 'transfer':
 
     # First, load the model. This works exactly the same way as in the 'resume' case,
     # Except it is a transfer learning model.
-    ckpt_path = os.path.join(pretrained_model_dir, 'ckpt_pruned.pt')
+    ckpt_path = os.path.join(pretrained_model_dir, model_file_name)
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
@@ -526,8 +527,8 @@ while True:
         print(f"Average data transfer time: {data_loading_tensor_transfer_time}")
         print(f"Average validation set eval time: {total_validation_set_eval_time}")
         print(f"Average logging time: {total_log_data_transfer_time}")
-        print(f"Printing cuda memory summary from pytorch:")
-        print(torch.cuda.memory_summary())
+        # print(f"Printing cuda memory summary from pytorch:")
+        # print(torch.cuda.memory_summary())
     iter_num += 1
     local_iter_num += 1
 

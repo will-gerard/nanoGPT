@@ -8,18 +8,23 @@ wandb_run_name='transfer-test' + str(time.time())
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-batch_size = 8
-block_size = 256
+batch_size = 12
+block_size = 1024
 gradient_accumulation_steps = 5
 
+# Architecture
+n_layer = 6
+n_head = 6
+n_embd = 384
+
 # this makes total number of tokens be 300B
-max_iters = 600000
-lr_decay_iters = 600000
+max_iters = 27000
+lr_decay_iters = 27000
 
 # eval stuff
-eval_interval = 5
+eval_interval = 30
 eval_iters = 5
-log_interval = 5
+log_interval = 10
 
 # weight decay
 weight_decay = 1e-1
